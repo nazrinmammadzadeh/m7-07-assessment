@@ -1,0 +1,14 @@
+{
+  "_note": "HTTP 202 Accepted. Poll GET /v1/jobs/{job_id} for status.",
+  "_response_headers": {
+    "X-Model-Version": "prod-20260607-a1b2c3d4",
+    "X-Request-ID": "770a0622-g41d-63f6-c938-668877662003",
+    "Location": "/v1/jobs/7f3b9a21-4c8e-4d56-b891-234567890abc",
+    "Content-Type": "application/json"
+  },
+  "job_id": "7f3b9a21-4c8e-4d56-b891-234567890abc",
+  "status": "queued",
+  "model_version": "prod-20260607-a1b2c3d4",
+  "submitted_at": "2026-06-07T00:30:00Z",
+  "estimated_completion_seconds": 90
+}

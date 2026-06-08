@@ -1,0 +1,36 @@
+{
+  "_response_headers": {
+    "X-Model-Version": "prod-20260607-a1b2c3d4",
+    "X-Request-ID": "660f9511-f30c-52e5-b827-557766551002",
+    "Content-Type": "application/json"
+  },
+  "results": [
+    {
+      "sensor_id": "SENS-00042",
+      "failure_prob_72h": 0.83,
+      "alert_triggered": true,
+      "prediction_id": "550e8400-e29b-41d4-a716-446655440001",
+      "model_version": "prod-20260607-a1b2c3d4",
+      "timestamp_utc": "2026-06-07T00:31:04Z"
+    },
+    {
+      "sensor_id": "SENS-00107",
+      "failure_prob_72h": 0.11,
+      "alert_triggered": false,
+      "prediction_id": "550e8400-e29b-41d4-a716-446655440002",
+      "model_version": "prod-20260607-a1b2c3d4",
+      "timestamp_utc": "2026-06-07T00:31:04Z"
+    },
+    {
+      "sensor_id": "SENS-00388",
+      "failure_prob_72h": 0.91,
+      "alert_triggered": true,
+      "prediction_id": "550e8400-e29b-41d4-a716-446655440003",
+      "model_version": "prod-20260607-a1b2c3d4",
+      "timestamp_utc": "2026-06-07T00:31:04Z"
+    }
+  ],
+  "model_version": "prod-20260607-a1b2c3d4",
+  "timestamp_utc": "2026-06-07T00:31:04Z",
+  "failed_sensor_ids": []
+}

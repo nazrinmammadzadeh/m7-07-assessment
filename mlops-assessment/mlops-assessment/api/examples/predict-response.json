@@ -1,0 +1,14 @@
+{
+  "_response_headers": {
+    "X-Model-Version": "prod-20260607-a1b2c3d4",
+    "X-Request-ID": "550e8400-e29b-41d4-a716-446655440001",
+    "X-Inference-Latency-Ms": 4.7,
+    "Content-Type": "application/json"
+  },
+  "sensor_id": "SENS-00042",
+  "failure_prob_72h": 0.83,
+  "alert_triggered": true,
+  "prediction_id": "550e8400-e29b-41d4-a716-446655440001",
+  "model_version": "prod-20260607-a1b2c3d4",
+  "timestamp_utc": "2026-06-07T14:32:11Z"
+}

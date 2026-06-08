@@ -1,0 +1,5 @@
+{
+  "input_s3_uri": "s3://acme-iot-data/batch-features/2026-06-07/features.parquet",
+  "output_s3_uri": "s3://acme-iot-data/batch-results/2026-06-07/",
+  "priority": "normal"
+}

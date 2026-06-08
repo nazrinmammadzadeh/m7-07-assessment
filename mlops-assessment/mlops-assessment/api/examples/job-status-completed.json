@@ -1,0 +1,17 @@
+{
+  "_note": "GET /v1/jobs/7f3b9a21-4c8e-4d56-b891-234567890abc — status: completed",
+  "_response_headers": {
+    "X-Model-Version": "prod-20260607-a1b2c3d4",
+    "Content-Type": "application/json"
+  },
+  "job_id": "7f3b9a21-4c8e-4d56-b891-234567890abc",
+  "status": "completed",
+  "model_version": "prod-20260607-a1b2c3d4",
+  "progress_pct": 100.0,
+  "output_s3_uri": "s3://acme-iot-data/batch-results/2026-06-07/",
+  "sensors_processed": 50000,
+  "sensors_total": 50000,
+  "error_message": null,
+  "started_at": "2026-06-07T00:30:02Z",
+  "completed_at": "2026-06-07T00:31:34Z"
+}

@@ -1,0 +1,129 @@
+# Model Registry Specification — lgbm-predictive-maintenance
+# All CI/CD pipelines and the deploy workflow must conform to this schema.
+# Image tag scheme defined here is enforced in cicd/.github/workflows/deploy-model.yml.
+
+schema_version: "1.0"
+
+model:
+  name: lgbm-predictive-maintenance
+  task: binary_classification
+  domain: industrial_iot
+  description: >
+    Predicts probability of sensor failure within 72 hours from a 168-step
+    (7-day hourly) rolling window of vibration RMS, vibration peak,
+    temperature mean/std, FFT dominant frequency, and trend slopes.
+    Threshold for alert trigger: failure_prob_72h >= 0.75.
+
+artefact:
+  format: lightgbm_ubj          # LightGBM UBJSON binary — smaller than text booster
+  filename: model.ubj
+  size_mb: 45
+  checksum_algorithm: sha256
+  checksum_filename: model.ubj.sha256
+  storage:
+    registry_url: https://registry.acme-iot.internal/models/lgbm-predictive-maintenance
+    # Artefact is FETCHED at image build time (see container/Dockerfile, model-fetcher stage)
+    # and BAKED into the runtime image. It is not fetched at container startup.
+
+versioning:
+  scheme: "{env}-{YYYYMMDD}-{git-sha-8}"
+  regex: "^(shadow|staging|prod)-[0-9]{8}-[0-9a-f]{8}$"
+  examples:
+    - prod-20260607-a1b2c3d4
+    - staging-20260607-e5f6a7b8
+    - shadow-20260607-c9d0e1f2
+  environments:
+    - shadow
+    - staging
+    - prod
+  # This scheme is used as both the MLflow model version tag
+  # AND the Docker image tag in ghcr.io/acme-iot/maintenance-predictor.
+  # The CI/CD pipeline (cicd/.github/workflows/deploy-model.yml) constructs
+  # the tag as: ${ENV}-$(date -u +%Y%m%d)-${GIT_SHA_8}
+
+container_image:
+  registry: ghcr.io/acme-iot/maintenance-predictor
+  tag_scheme: "{env}-{YYYYMMDD}-{git-sha-8}"   # same as versioning.scheme
+  # Image tag and model version are always 1:1; rolling back the image
+  # rolls back the model. See runbooks/rollback.md.
+
+stages:
+  candidate:
+    description: Model has passed offline evaluation gates; not yet deployed.
+    entry_gate: automated_ci
+    required_metrics:
+      auc_roc: ">= 0.82"
+      precision_at_0_5: ">= 0.80"
+      f1_score: ">= 0.75"
+    required_artefacts:
+      - model.ubj
+      - model.ubj.sha256
+      - feature_schema.json
+      - shap_summary.png
+
+  staging:
+    description: >
+      Model is deployed to staging environment and running in shadow mode
+      alongside the current production model for 7 calendar days.
+    entry_gate: ml-lead                 # must approve transition from candidate
+    required_metrics:
+      auc_roc: ">= 0.82"
+      shadow_auc_regression_vs_prod: "<= 0.02"   # max absolute drop
+      shadow_latency_p95_ms: "<= 120"
+    required_artefacts:
+      - model.ubj
+      - model.ubj.sha256
+      - feature_schema.json
+      - evaluation_report.html
+    minimum_shadow_days: 7
+
+  production:
+    description: Model is serving 100% of live traffic after passing canary gate.
+    entry_gate: ops-lead                # must approve transition from staging
+    required_metrics:
+      canary_error_rate_pct: "< 1.0"          # over 30-min canary window
+      canary_latency_p95_ms: "<= 120"          # matches serving/slos.yaml alert_latency_p95
+    required_artefacts:
+      - model.ubj
+      - model.ubj.sha256
+      - feature_schema.json
+      - evaluation_report.html
+      - deployment_approval.pdf             # signed PDF from ops-lead
+
+  archived:
+    description: >
+      Model was superseded by a newer production version or rolled back.
+      Artefacts retained per retention policy below.
+    entry_gate: ml-lead
+    transition_from:
+      - production
+      - staging
+
+lineage:
+  # Required fields per model version registered in MLflow
+  required_fields:
+    - training_dataset_s3_uri
+    - training_dataset_date_range
+    - training_dataset_row_count
+    - label_source_s3_uri
+    - feature_schema_version          # hash of feature_schema.json
+    - training_code_git_sha
+    - lightgbm_version
+    - python_version
+    - training_started_at_utc
+    - training_completed_at_utc
+  example:
+    training_dataset_s3_uri: "s3://acme-iot-data/sensor-features/training/"
+    training_dataset_date_range: "2025-06-01 to 2026-06-01"
+    training_dataset_row_count: 18000000
+    label_source_s3_uri: "s3://acme-iot-data/maintenance-logs/confirmed-failures/"
+    feature_schema_version: "sha256:abc123..."
+    training_code_git_sha: "a1b2c3d4e5f6..."
+    lightgbm_version: "4.3.0"
+    python_version: "3.11"
+
+retention:
+  production_versions_to_keep: 3     # ensures 3 rollback targets are always available
+  staging_versions_to_keep: 5
+  archived_versions_purge_after_days: 90
+  # Purge deletes artefacts from the internal registry but retains MLflow metadata.

@@ -1,0 +1,129 @@
+# slos.yaml — Service Level Objectives
+# Service: maintenance-predictor
+#
+# These values are the single source of truth for:
+#   - monitoring/alerts.yaml  (burn-rate multipliers and alert thresholds)
+#   - serving/capacity-plan.md (latency budget and replica math)
+#   - runbooks/rollback.md    (rollback trigger conditions)
+#
+# Do NOT change a threshold here without updating all three files above.
+
+service: maintenance-predictor
+owner: ml-platform-team
+slack_channel: "#ml-platform-oncall"
+review_cadence: quarterly
+last_reviewed: 2026-06-07
+
+slos:
+
+  - id: alert_latency_p95
+    display_name: "Critical-path HTTP p95 latency"
+    description: >
+      95th percentile HTTP response time for POST /v1/predict must be ≤ 120 ms,
+      measured over any 5-minute window. This is the latency the Flink consumer
+      experiences per inference call on the critical sensor path.
+    objective_pct: 99.9
+    window: 30d
+    sli:
+      type: latency
+      metric: http_request_duration_seconds
+      labels:
+        endpoint: "/v1/predict"
+        method: POST
+      percentile: 95
+      threshold_ms: 120         # matches serving/capacity-plan.md latency budget
+    error_budget:
+      total_minutes: 43200      # 30 days × 1440 min/day
+      budget_pct: 0.1
+      budget_minutes: 43.2      # 43 min 12 s per 30-day window
+
+  - id: api_availability
+    display_name: "API availability (non-5xx)"
+    description: >
+      HTTP 5xx error rate across all /v1/* endpoints must be < 0.1%
+      (i.e., 99.9% of requests return a non-5xx status), measured over a
+      30-day rolling window.
+    objective_pct: 99.9
+    window: 30d
+    sli:
+      type: availability
+      good_requests: "http_requests_total{service='maintenance-predictor', status_code!~'5..'}"
+      total_requests: "http_requests_total{service='maintenance-predictor'}"
+    error_budget:
+      budget_pct: 0.1
+      budget_minutes: 43.2
+
+  - id: batch_job_success
+    display_name: "Daily batch job success rate"
+    description: >
+      The daily Spark batch inference job (50,000 sensors, triggered at 00:30 UTC)
+      must complete successfully (exit code 0, results written to S3) by 06:00 UTC.
+      Target: 99.5% of calendar days over a 30-day window.
+    objective_pct: 99.5
+    window: 30d
+    sli:
+      type: availability
+      good_events: "batch_job_success_total{service='maintenance-predictor-batch'}"
+      total_events: "batch_job_scheduled_total{service='maintenance-predictor-batch'}"
+    error_budget:
+      budget_pct: 0.5
+      budget_days: 0.15         # ~3 hours 36 minutes per 30-day month
+
+  - id: end_to_end_alert_latency
+    display_name: "End-to-end critical alert latency"
+    description: >
+      p95 of the time from sensor MQTT reading to PagerDuty alert delivery
+      must be ≤ 300 seconds (5 minutes), measured over any 24-hour window.
+      This SLO spans the full pipeline: Kafka ingestion → Flink → HTTP inference
+      → alert dispatch.
+    objective_pct: 99.0
+    window: 30d
+    sli:
+      type: latency
+      metric: alert_pipeline_duration_seconds
+      percentile: 95
+      threshold_s: 300          # 5-minute end-to-end budget
+    error_budget:
+      budget_pct: 1.0
+      budget_minutes: 432.0     # 7 h 12 min per 30-day window
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Burn-rate alert configuration
+# Used verbatim in monitoring/alerts.yaml.
+# Fast burn: pages immediately (wakes someone up).
+# Slow burn: Slack warning; no page until it becomes fast burn.
+# ─────────────────────────────────────────────────────────────────────────────
+burn_rate_alerts:
+
+  fast_burn:
+    window_minutes: 60          # 1-hour window
+    multiplier: 14.4            # consuming 2% of monthly budget in 1 hour
+    severity: critical
+    page: true
+    rationale: >
+      At 14.4× burn rate over 1 hour, the full 30-day error budget would be
+      exhausted in ~2 hours. Immediate action required.
+
+  slow_burn:
+    window_minutes: 360         # 6-hour window
+    multiplier: 6.0             # consuming 5% of monthly budget in 6 hours
+    severity: warning
+    page: false
+    rationale: >
+      At 6× burn rate over 6 hours, the full budget would be exhausted in
+      ~5 days. Monitor closely; escalate if fast-burn fires.
+
+# Derived alert thresholds (pre-computed for monitoring/alerts.yaml):
+#
+#   alert_latency_p95 + api_availability (objective: 99.9%, budget: 0.1%):
+#     fast_burn  threshold: 1 - (14.4 × 0.001) = 0.9856  (good-request fraction)
+#     slow_burn  threshold: 1 - (6.0  × 0.001) = 0.994
+#
+#   Equivalently for error rate:
+#     fast_burn  error_rate > 14.4 × 0.001 = 0.0144  (1.44%)
+#     slow_burn  error_rate > 6.0  × 0.001 = 0.006   (0.6%)
+#
+#   end_to_end_alert_latency rollback pre-trigger:
+#     fire when p95 > 240 s (80% of 300 s budget) for 5 consecutive minutes
+#     → this is the EndToEndAlertLatencyHigh alert in monitoring/alerts.yaml
+#     → this is the rollback trigger in runbooks/rollback.md

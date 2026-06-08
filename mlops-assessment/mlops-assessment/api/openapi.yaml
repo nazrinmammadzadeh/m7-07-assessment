@@ -1,0 +1,661 @@
+openapi: "3.1.0"
+
+info:
+  title: Predictive Maintenance Inference API
+  version: "1.0.0"
+  description: |
+    Inference API for the `lgbm-predictive-maintenance` model (Scenario Y — Industrial IoT).
+
+    **Three endpoint groups:**
+    - **Sync** `POST /v1/predict` — single-sensor prediction for the Flink critical-path consumer.  
+      p95 target: ≤ 120 ms (matches `serving/slos.yaml` `alert_latency_p95`).
+    - **Batch** `POST /v1/predict/batch` — up to 500 sensors in one synchronous request.  
+      Used by the daily Spark job in chunks.
+    - **Async** `POST /v1/jobs` — submit a 50,000-sensor job; poll `GET /v1/jobs/{job_id}`.  
+      Results written to the caller-specified S3 prefix.
+
+    **Observability headers on every response:**  
+    `X-Model-Version` carries the serving model version (`{env}-{YYYYMMDD}-{git-sha-8}`).  
+    The `monitoring/alerts.yaml` `ModelVersionMismatch` alert keys on this header value  
+    (surfaced as the `model_version` Prometheus label) to detect replicas running  
+    different model versions during rolling deployments.
+
+    **Errors:** RFC 7807 `application/problem+json` on all 4xx/5xx responses.
+
+  contact:
+    name: Acme IoT ML Platform
+    email: ml-platform@acme-iot.internal
+
+servers:
+  - url: https://api.acme-iot.internal/maintenance-predictor
+    description: Production
+  - url: https://api-staging.acme-iot.internal/maintenance-predictor
+    description: Staging
+
+tags:
+  - name: sync
+    description: Single-sensor synchronous prediction (critical real-time path)
+  - name: batch
+    description: Multi-sensor synchronous batch prediction (up to 500 sensors)
+  - name: async
+    description: Asynchronous large-scale inference jobs (up to 50,000 sensors)
+  - name: ops
+    description: Health, readiness, and Prometheus metrics
+
+paths:
+
+  /v1/predict:
+    post:
+      tags: [sync]
+      operationId: predictSingle
+      summary: Predict failure probability for one sensor
+      description: |
+        Designed for the Flink critical-path consumer. Accepts a single sensor's
+        pre-computed feature vector and returns `failure_prob_72h`.
+        If `failure_prob_72h >= 0.75`, the service also sets `alert_triggered: true`
+        and publishes an internal alert event; the Alert Service fans it out to
+        PagerDuty and SMTP.
+
+        p95 latency target: **120 ms** (see `serving/slos.yaml`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SinglePredictRequest"
+            example:
+              sensor_id: "SENS-00042"
+              feature_vector:
+                vibration_rms_24h: 2.34
+                vibration_peak_24h: 4.12
+                temp_mean_24h: 67.3
+                temp_std_24h: 1.8
+                fft_dominant_freq_hz: 88.5
+                vibration_trend_7d: 0.12
+                temp_trend_7d: -0.04
+      responses:
+        "200":
+          description: Successful prediction
+          headers:
+            X-Model-Version:
+              $ref: "#/components/headers/X-Model-Version"
+            X-Request-ID:
+              $ref: "#/components/headers/X-Request-ID"
+            X-Inference-Latency-Ms:
+              $ref: "#/components/headers/X-Inference-Latency-Ms"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SinglePredictResponse"
+              example:
+                sensor_id: "SENS-00042"
+                failure_prob_72h: 0.83
+                alert_triggered: true
+                prediction_id: "550e8400-e29b-41d4-a716-446655440001"
+                model_version: "prod-20260607-a1b2c3d4"
+                timestamp_utc: "2026-06-07T14:32:11Z"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /v1/predict/batch:
+    post:
+      tags: [batch]
+      operationId: predictBatch
+      summary: Predict failure probabilities for up to 500 sensors (synchronous)
+      description: |
+        Synchronous batch prediction. The daily Spark job calls this endpoint
+        in chunks of up to 500 sensors.
+
+        Partial success is supported: if some sensors have invalid feature vectors,
+        their `sensor_id` values appear in `failed_sensor_ids` and the remaining
+        predictions are returned normally.
+
+        p95 latency target: **2,000 ms** for a full 500-sensor batch.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BatchPredictRequest"
+      responses:
+        "200":
+          description: Successful batch prediction (may include partial failures)
+          headers:
+            X-Model-Version:
+              $ref: "#/components/headers/X-Model-Version"
+            X-Request-ID:
+              $ref: "#/components/headers/X-Request-ID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BatchPredictResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /v1/jobs:
+    post:
+      tags: [async]
+      operationId: submitInferenceJob
+      summary: Submit an asynchronous inference job (up to 50,000 sensors)
+      description: |
+        Accepts an S3 URI pointing to a Parquet file of feature vectors for
+        up to 50,000 sensors. Returns a `job_id` immediately (HTTP 202).
+        Poll `GET /v1/jobs/{job_id}` for status.
+        When `status = completed`, results are in the caller-specified `output_s3_uri`.
+
+        Used by the daily batch inference job triggered at 00:30 UTC.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/JobSubmitRequest"
+            example:
+              input_s3_uri: "s3://acme-iot-data/batch-features/2026-06-07/features.parquet"
+              output_s3_uri: "s3://acme-iot-data/batch-results/2026-06-07/"
+              priority: "normal"
+      responses:
+        "202":
+          description: Job accepted and queued
+          headers:
+            X-Model-Version:
+              $ref: "#/components/headers/X-Model-Version"
+            X-Request-ID:
+              $ref: "#/components/headers/X-Request-ID"
+            Location:
+              description: URL to poll for job status
+              schema:
+                type: string
+                example: "/v1/jobs/7f3b9a21-4c8e-4d56-b891-234567890abc"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobSubmitResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /v1/jobs/{job_id}:
+    get:
+      tags: [async]
+      operationId: getJobStatus
+      summary: Poll inference job status
+      parameters:
+        - name: job_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          example: "7f3b9a21-4c8e-4d56-b891-234567890abc"
+      responses:
+        "200":
+          description: Job status (queued | running | completed | failed)
+          headers:
+            X-Model-Version:
+              $ref: "#/components/headers/X-Model-Version"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobStatusResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /healthz:
+    get:
+      tags: [ops]
+      operationId: healthCheck
+      summary: Liveness probe — service process alive
+      description: |
+        Returns 200 if the process is running. Does NOT check model load or
+        Redis connectivity (use /readyz for that). Kubernetes uses this for
+        the liveness probe.
+      responses:
+        "200":
+          description: Service is alive
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    const: "ok"
+              example:
+                status: "ok"
+
+  /readyz:
+    get:
+      tags: [ops]
+      operationId: readinessCheck
+      summary: Readiness probe — model loaded and Redis reachable
+      description: |
+        Returns 200 only when:
+        - LightGBM model is loaded from `/app/model/model.ubj`
+        - Redis feature store is reachable (PING < 10 ms)
+
+        Returns 503 during startup or if Redis is unavailable.
+        Kubernetes uses this for the readiness probe.
+      responses:
+        "200":
+          description: Service is ready to accept traffic
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, model_version]
+                properties:
+                  status:
+                    type: string
+                    const: "ready"
+                  model_version:
+                    type: string
+                    description: Currently loaded model version (matches X-Model-Version)
+                    example: "prod-20260607-a1b2c3d4"
+                  redis_ping_ms:
+                    type: number
+                    example: 0.8
+              example:
+                status: "ready"
+                model_version: "prod-20260607-a1b2c3d4"
+                redis_ping_ms: 0.8
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /metrics:
+    get:
+      tags: [ops]
+      operationId: prometheusMetrics
+      summary: Prometheus metrics (text format)
+      description: |
+        Exposes Prometheus metrics including:
+        - `http_request_duration_seconds` (histogram, labels: endpoint, method, status_code, model_version)
+        - `http_requests_total` (counter, labels: endpoint, method, status_code, model_version)
+        - `model_inference_duration_seconds` (histogram)
+        - `alert_pipeline_duration_seconds` (histogram — end-to-end latency from Flink trigger)
+        - `feature_drift_ks_pvalue` (gauge, label: feature)
+        - `failure_prob_72h` (histogram — prediction distribution monitoring)
+
+        The `model_version` label is populated from the `X-Model-Version` header value,
+        enabling the `ModelVersionMismatch` alert in `monitoring/alerts.yaml` to detect
+        replicas serving different model versions.
+      responses:
+        "200":
+          description: Prometheus text exposition format
+          content:
+            text/plain:
+              schema:
+                type: string
+
+components:
+
+  headers:
+    X-Model-Version:
+      description: |
+        Model version that served this request.
+        Format: `{env}-{YYYYMMDD}-{git-sha-8}` (defined in `lifecycle/model-registry.yaml`).
+        Used by `monitoring/alerts.yaml` `ModelVersionMismatch` alert to detect replicas
+        running different model versions simultaneously.
+      required: true
+      schema:
+        type: string
+        pattern: "^(shadow|staging|prod)-[0-9]{8}-[0-9a-f]{8}$"
+        example: "prod-20260607-a1b2c3d4"
+
+    X-Request-ID:
+      description: UUID for end-to-end distributed tracing. Echo this in support tickets.
+      required: true
+      schema:
+        type: string
+        format: uuid
+        example: "550e8400-e29b-41d4-a716-446655440000"
+
+    X-Inference-Latency-Ms:
+      description: Time spent exclusively in `model.predict()` in milliseconds.
+      required: false
+      schema:
+        type: number
+        example: 4.7
+
+  schemas:
+
+    SensorFeatures:
+      type: object
+      required:
+        - vibration_rms_24h
+        - vibration_peak_24h
+        - temp_mean_24h
+        - temp_std_24h
+        - fft_dominant_freq_hz
+        - vibration_trend_7d
+        - temp_trend_7d
+      properties:
+        vibration_rms_24h:
+          type: number
+          description: RMS vibration over the last 24 hours (mm/s)
+          minimum: 0
+          example: 2.34
+        vibration_peak_24h:
+          type: number
+          description: Peak vibration amplitude over the last 24 hours (mm/s)
+          minimum: 0
+          example: 4.12
+        temp_mean_24h:
+          type: number
+          description: Mean temperature over the last 24 hours (°C)
+          example: 67.3
+        temp_std_24h:
+          type: number
+          description: Standard deviation of temperature over the last 24 hours (°C)
+          minimum: 0
+          example: 1.8
+        fft_dominant_freq_hz:
+          type: number
+          description: Dominant frequency from FFT of the vibration signal (Hz)
+          minimum: 0
+          example: 88.5
+        vibration_trend_7d:
+          type: number
+          description: Linear trend slope of vibration RMS over 7 days (mm/s per day)
+          example: 0.12
+        temp_trend_7d:
+          type: number
+          description: Linear trend slope of mean temperature over 7 days (°C per day)
+          example: -0.04
+
+    SinglePredictRequest:
+      type: object
+      required: [sensor_id, feature_vector]
+      properties:
+        sensor_id:
+          type: string
+          description: Unique sensor identifier
+          example: "SENS-00042"
+        feature_vector:
+          $ref: "#/components/schemas/SensorFeatures"
+
+    SinglePredictResponse:
+      type: object
+      required: [sensor_id, failure_prob_72h, alert_triggered, prediction_id, model_version, timestamp_utc]
+      properties:
+        sensor_id:
+          type: string
+          example: "SENS-00042"
+        failure_prob_72h:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 1
+          description: Predicted probability of failure within the next 72 hours
+          example: 0.83
+        alert_triggered:
+          type: boolean
+          description: "`true` when `failure_prob_72h >= 0.75`; Alert Service dispatches PagerDuty/SMTP."
+          example: true
+        prediction_id:
+          type: string
+          format: uuid
+          description: Unique ID for this prediction. Use for audit trail and support queries.
+          example: "550e8400-e29b-41d4-a716-446655440001"
+        model_version:
+          type: string
+          description: Same value as `X-Model-Version` response header.
+          example: "prod-20260607-a1b2c3d4"
+        timestamp_utc:
+          type: string
+          format: date-time
+          example: "2026-06-07T14:32:11Z"
+
+    BatchPredictRequest:
+      type: object
+      required: [sensors]
+      properties:
+        sensors:
+          type: array
+          minItems: 1
+          maxItems: 500
+          items:
+            $ref: "#/components/schemas/SinglePredictRequest"
+          description: "List of 1–500 sensor feature vectors."
+
+    BatchPredictResponse:
+      type: object
+      required: [results, model_version, timestamp_utc]
+      properties:
+        results:
+          type: array
+          items:
+            $ref: "#/components/schemas/SinglePredictResponse"
+        model_version:
+          type: string
+          example: "prod-20260607-a1b2c3d4"
+        timestamp_utc:
+          type: string
+          format: date-time
+        failed_sensor_ids:
+          type: array
+          description: Sensor IDs for which prediction failed (partial success). Empty if all succeeded.
+          items:
+            type: string
+          example: []
+
+    JobSubmitRequest:
+      type: object
+      required: [input_s3_uri, output_s3_uri]
+      properties:
+        input_s3_uri:
+          type: string
+          description: S3 URI of input Parquet file containing feature vectors for all sensors.
+          example: "s3://acme-iot-data/batch-features/2026-06-07/features.parquet"
+        output_s3_uri:
+          type: string
+          description: S3 URI prefix where output Parquet will be written on completion.
+          example: "s3://acme-iot-data/batch-results/2026-06-07/"
+        priority:
+          type: string
+          enum: [normal, high]
+          default: normal
+          description: "`high` jobs are placed at the front of the queue."
+
+    JobSubmitResponse:
+      type: object
+      required: [job_id, status, model_version, submitted_at]
+      properties:
+        job_id:
+          type: string
+          format: uuid
+          example: "7f3b9a21-4c8e-4d56-b891-234567890abc"
+        status:
+          type: string
+          enum: [queued]
+        model_version:
+          type: string
+          example: "prod-20260607-a1b2c3d4"
+        submitted_at:
+          type: string
+          format: date-time
+          example: "2026-06-07T00:30:00Z"
+        estimated_completion_seconds:
+          type: integer
+          description: Estimated seconds until job completes (non-binding).
+          example: 90
+
+    JobStatusResponse:
+      type: object
+      required: [job_id, status]
+      properties:
+        job_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [queued, running, completed, failed]
+        model_version:
+          type: string
+          example: "prod-20260607-a1b2c3d4"
+        progress_pct:
+          type: number
+          minimum: 0
+          maximum: 100
+          description: Populated when `status = running`.
+          example: 62.5
+        output_s3_uri:
+          type: string
+          description: Populated when `status = completed`.
+          example: "s3://acme-iot-data/batch-results/2026-06-07/"
+        sensors_processed:
+          type: integer
+          example: 31250
+        sensors_total:
+          type: integer
+          example: 50000
+        error_message:
+          type: string
+          description: Populated when `status = failed`.
+        started_at:
+          type: string
+          format: date-time
+        completed_at:
+          type: string
+          format: date-time
+          description: Populated when `status = completed` or `failed`.
+
+    ProblemDetail:
+      type: object
+      required: [type, title, status, detail]
+      description: RFC 7807 Problem Detail object returned on all 4xx/5xx responses.
+      properties:
+        type:
+          type: string
+          format: uri
+          example: "https://errors.acme-iot.internal/bad-request"
+        title:
+          type: string
+          example: "Bad Request"
+        status:
+          type: integer
+          example: 400
+        detail:
+          type: string
+          example: "sensor_id is required"
+        instance:
+          type: string
+          format: uri
+          example: "/v1/predict"
+        request_id:
+          type: string
+          format: uuid
+          example: "550e8400-e29b-41d4-a716-446655440000"
+
+  responses:
+    BadRequest:
+      description: Request body failed schema validation.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ProblemDetail"
+          example:
+            type: "https://errors.acme-iot.internal/bad-request"
+            title: "Bad Request"
+            status: 400
+            detail: "sensor_id is required and must be a non-empty string"
+            instance: "/v1/predict"
+            request_id: "550e8400-e29b-41d4-a716-446655440000"
+
+    UnprocessableEntity:
+      description: Feature vector contains NaN, null, or out-of-range values.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ProblemDetail"
+          example:
+            type: "https://errors.acme-iot.internal/unprocessable-entity"
+            title: "Unprocessable Entity"
+            status: 422
+            detail: "vibration_rms_24h must be >= 0; got -1.2"
+            instance: "/v1/predict"
+            request_id: "550e8400-e29b-41d4-a716-446655440002"
+
+    TooManyRequests:
+      description: Rate limit exceeded. Retry after the indicated number of seconds.
+      headers:
+        Retry-After:
+          description: Seconds to wait before retrying.
+          schema:
+            type: integer
+            example: 5
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ProblemDetail"
+
+    PayloadTooLarge:
+      description: Batch request exceeds 500 sensors.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ProblemDetail"
+          example:
+            type: "https://errors.acme-iot.internal/payload-too-large"
+            title: "Payload Too Large"
+            status: 413
+            detail: "Batch size 750 exceeds maximum of 500 sensors per request. Use POST /v1/jobs for larger batches."
+            instance: "/v1/predict/batch"
+            request_id: "550e8400-e29b-41d4-a716-446655440003"
+
+    NotFound:
+      description: Job ID does not exist.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ProblemDetail"
+
+    InternalServerError:
+      description: Unhandled server error.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ProblemDetail"
+          example:
+            type: "https://errors.acme-iot.internal/internal-server-error"
+            title: "Internal Server Error"
+            status: 500
+            detail: "An unexpected error occurred. The request_id has been logged."
+            request_id: "550e8400-e29b-41d4-a716-446655440004"
+
+    ServiceUnavailable:
+      description: Model not loaded or Redis feature store is unreachable.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ProblemDetail"
+          example:
+            type: "https://errors.acme-iot.internal/service-unavailable"
+            title: "Service Unavailable"
+            status: 503
+            detail: "Redis feature store is unreachable. The service is not accepting traffic."
+            request_id: "550e8400-e29b-41d4-a716-446655440005"

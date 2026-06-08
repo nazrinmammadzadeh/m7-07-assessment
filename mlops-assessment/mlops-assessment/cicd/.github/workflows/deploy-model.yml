@@ -1,0 +1,334 @@
+# cicd/.github/workflows/deploy-model.yml
+#
+# Deploys a new model version of lgbm-predictive-maintenance.
+#
+# Image tag scheme: {env}-{YYYYMMDD}-{git-sha-8}
+# This scheme is defined in lifecycle/model-registry.yaml (versioning.scheme)
+# and must not be changed here independently.
+#
+# Triggered by:
+#   - Manual dispatch (workflow_dispatch) with model_version + target_env
+#   - Repository dispatch from the MLflow promotion webhook (model-promoted event)
+#
+# Job chain (dependency enforced):
+#   validate-model → build-and-scan → deploy-staging → deploy-production
+#   (deploy-production only runs if target_env == 'production' and has manual approval gate)
+
+name: Deploy Model
+
+on:
+  workflow_dispatch:
+    inputs:
+      model_version:
+        description: "Model version from MLflow (e.g. prod-20260607-a1b2c3d4)"
+        required: true
+        type: string
+      target_env:
+        description: "Target environment"
+        required: true
+        type: choice
+        options: [staging, production]
+  repository_dispatch:
+    types: [model-promoted]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: acme-iot/maintenance-predictor
+  MODEL_REGISTRY_URL: https://registry.acme-iot.internal/models
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write          # OIDC for AWS auth
+  security-events: write   # Trivy SARIF upload
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Job 1: Validate that the model version exists in the internal registry
+# ─────────────────────────────────────────────────────────────────────────────
+jobs:
+  validate-model:
+    name: Validate Model Version
+    runs-on: ubuntu-24.04
+    outputs:
+      model_version: ${{ steps.parse.outputs.model_version }}
+      git_sha:       ${{ steps.parse.outputs.git_sha }}
+      build_date:    ${{ steps.parse.outputs.build_date }}
+      target_env:    ${{ steps.parse.outputs.target_env }}
+    steps:
+      - name: Parse inputs
+        id: parse
+        run: |
+          VERSION="${{ github.event.inputs.model_version || github.event.client_payload.model_version }}"
+          ENV="${{ github.event.inputs.target_env || github.event.client_payload.target_env }}"
+          # Extract 8-char git SHA from the version tag: {env}-{YYYYMMDD}-{sha8}
+          GIT_SHA=$(echo "$VERSION" | awk -F'-' '{print $NF}')
+          BUILD_DATE=$(date -u +%Y%m%d)
+          echo "model_version=$VERSION"   >> "$GITHUB_OUTPUT"
+          echo "git_sha=$GIT_SHA"         >> "$GITHUB_OUTPUT"
+          echo "build_date=$BUILD_DATE"   >> "$GITHUB_OUTPUT"
+          echo "target_env=$ENV"          >> "$GITHUB_OUTPUT"
+
+          # Validate format matches lifecycle/model-registry.yaml versioning.regex
+          if ! echo "$VERSION" | grep -qE '^(shadow|staging|prod)-[0-9]{8}-[0-9a-f]{8}$'; then
+            echo "::error::model_version '$VERSION' does not match required format {env}-{YYYYMMDD}-{git-sha-8}"
+            exit 1
+          fi
+
+      - name: Verify model artefact in internal registry
+        run: |
+          HTTP_STATUS=$(curl -o /dev/null -s -w "%{http_code}" \
+            -H "Authorization: Bearer ${{ secrets.MODEL_REGISTRY_TOKEN }}" \
+            "${{ env.MODEL_REGISTRY_URL }}/lgbm-predictive-maintenance/${{ steps.parse.outputs.model_version }}/model.ubj")
+          if [ "$HTTP_STATUS" != "200" ]; then
+            echo "::error::Model artefact not found (HTTP $HTTP_STATUS). Version: ${{ steps.parse.outputs.model_version }}"
+            exit 1
+          fi
+          echo "✅ Model artefact verified in registry"
+
+      - name: Verify MLflow stage matches target_env
+        run: |
+          # Ensures we don't accidentally deploy a 'staging' model to production
+          MLFLOW_STAGE=$(curl -s \
+            -H "Authorization: Bearer ${{ secrets.MLFLOW_TOKEN }}" \
+            "${{ secrets.MLFLOW_URL }}/api/2.0/mlflow/model-versions/get?name=lgbm-predictive-maintenance&version=${{ steps.parse.outputs.model_version }}" \
+            | jq -r '.model_version.current_stage')
+          ENV="${{ steps.parse.outputs.target_env }}"
+          EXPECTED_STAGE=$([ "$ENV" = "production" ] && echo "Production" || echo "Staging")
+          if [ "$MLFLOW_STAGE" != "$EXPECTED_STAGE" ]; then
+            echo "::error::MLflow stage '$MLFLOW_STAGE' does not match target_env '$ENV' (expected '$EXPECTED_STAGE')"
+            exit 1
+          fi
+          echo "✅ MLflow stage matches target environment"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Job 2: Build multi-stage image, run Trivy security scan, push to GHCR
+# Image tag: {env}-{YYYYMMDD}-{git-sha-8}  ← matches lifecycle/model-registry.yaml
+# ─────────────────────────────────────────────────────────────────────────────
+  build-and-scan:
+    name: Build & Scan Image
+    needs: validate-model
+    runs-on: ubuntu-24.04
+    outputs:
+      image_tag:    ${{ steps.meta.outputs.full_tag }}
+      image_digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Compute image tag
+        id: meta
+        run: |
+          ENV="${{ needs.validate-model.outputs.target_env }}"
+          DATE="${{ needs.validate-model.outputs.build_date }}"
+          SHA="${{ needs.validate-model.outputs.git_sha }}"
+          # Tag scheme: {env}-{YYYYMMDD}-{git-sha-8} — must match lifecycle/model-registry.yaml
+          FULL_TAG="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${ENV}-${DATE}-${SHA}"
+          echo "full_tag=$FULL_TAG" >> "$GITHUB_OUTPUT"
+          echo "Building image: $FULL_TAG"
+
+      - name: Build image (load locally for scanning)
+        uses: docker/build-push-action@v5
+        with:
+          context: container/
+          file: container/Dockerfile
+          push: false
+          load: true
+          tags: ${{ steps.meta.outputs.full_tag }}
+          build-args: |
+            MODEL_VERSION=${{ needs.validate-model.outputs.model_version }}
+            GIT_SHA=${{ needs.validate-model.outputs.git_sha }}
+            BUILD_DATE=${{ needs.validate-model.outputs.build_date }}
+            MODEL_REGISTRY_URL=${{ env.MODEL_REGISTRY_URL }}
+          secrets: |
+            registry_token=${{ secrets.MODEL_REGISTRY_TOKEN }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Scan image with Trivy
+        uses: aquasecurity/trivy-action@0.20.0
+        with:
+          image-ref: ${{ steps.meta.outputs.full_tag }}
+          format: sarif
+          output: trivy-results.sarif
+          exit-code: "1"           # CRITICAL CVEs block the pipeline
+          severity: CRITICAL
+          ignore-unfixed: true
+
+      - name: Upload Trivy SARIF to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-results.sarif
+
+      - name: Open issue for HIGH CVEs (non-blocking)
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `HIGH CVEs found in image ${{ steps.meta.outputs.full_tag }}`,
+              body: 'Trivy found HIGH severity CVEs. See Security tab for details.',
+              labels: ['security', 'high-cve'],
+            });
+
+      - name: Push verified image to GHCR
+        id: push
+        uses: docker/build-push-action@v5
+        with:
+          context: container/
+          file: container/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.full_tag }}
+          build-args: |
+            MODEL_VERSION=${{ needs.validate-model.outputs.model_version }}
+            GIT_SHA=${{ needs.validate-model.outputs.git_sha }}
+            BUILD_DATE=${{ needs.validate-model.outputs.build_date }}
+            MODEL_REGISTRY_URL=${{ env.MODEL_REGISTRY_URL }}
+          secrets: |
+            registry_token=${{ secrets.MODEL_REGISTRY_TOKEN }}
+          cache-from: type=gha
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Job 3: Deploy to staging + smoke test + load test gate
+# ─────────────────────────────────────────────────────────────────────────────
+  deploy-staging:
+    name: Deploy to Staging
+    needs: [validate-model, build-and-scan]
+    runs-on: ubuntu-24.04
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-actions-staging
+          aws-region: eu-west-1
+
+      - name: Deploy to staging cluster
+        run: |
+          aws eks update-kubeconfig --name acme-iot-staging --region eu-west-1
+          kubectl set image deployment/maintenance-predictor \
+            predictor=${{ needs.build-and-scan.outputs.image_tag }} \
+            -n maintenance-predictor
+          kubectl rollout status deployment/maintenance-predictor \
+            -n maintenance-predictor --timeout=180s
+
+      - name: Smoke test — liveness and readiness
+        run: |
+          ENDPOINT="https://api-staging.acme-iot.internal/maintenance-predictor"
+          for probe in healthz readyz; do
+            STATUS=$(curl -o /dev/null -s -w "%{http_code}" "${ENDPOINT}/${probe}")
+            if [ "$STATUS" != "200" ]; then
+              echo "::error::${probe} returned HTTP $STATUS"
+              exit 1
+            fi
+          done
+          # Verify X-Model-Version header is present and correctly formatted
+          MODEL_VER=$(curl -si "${ENDPOINT}/v1/predict" \
+            -X POST -H "Content-Type: application/json" \
+            -d '{"sensor_id":"SMOKE-00001","feature_vector":{"vibration_rms_24h":1.5,"vibration_peak_24h":2.1,"temp_mean_24h":65.0,"temp_std_24h":1.0,"fft_dominant_freq_hz":75.0,"vibration_trend_7d":0.0,"temp_trend_7d":0.0}}' \
+            | grep -i "X-Model-Version" | awk '{print $2}' | tr -d '\r')
+          EXPECTED="${{ needs.validate-model.outputs.model_version }}"
+          if [ "$MODEL_VER" != "$EXPECTED" ]; then
+            echo "::error::X-Model-Version mismatch: got '$MODEL_VER', expected '$EXPECTED'"
+            exit 1
+          fi
+          echo "✅ Smoke test passed. Model version: $MODEL_VER"
+
+      - name: Load test gate (steady-state — serving/load-test-plan.md Scenario 1)
+        run: |
+          docker run --rm grafana/k6:0.50.0 run \
+            -e TARGET=https://api-staging.acme-iot.internal/maintenance-predictor \
+            --out json=k6-results.json \
+            tests/load/steady_state.js
+          # k6 exits non-zero if any threshold fails; this gates the pipeline
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Job 4: Deploy to production — canary rollout + 30-min gate + full rollout
+# Requires manual approval from ops-lead via GitHub Environments
+# Only runs when target_env == 'production'
+# ─────────────────────────────────────────────────────────────────────────────
+  deploy-production:
+    name: Deploy to Production
+    needs: [validate-model, build-and-scan, deploy-staging]
+    runs-on: ubuntu-24.04
+    environment: production    # GitHub Environment with required reviewer: ops-lead
+    if: needs.validate-model.outputs.target_env == 'production'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-actions-production
+          aws-region: eu-west-1
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name acme-iot-prod --region eu-west-1
+
+      - name: Canary rollout — 10% traffic
+        run: |
+          kubectl set image deployment/maintenance-predictor-canary \
+            predictor=${{ needs.build-and-scan.outputs.image_tag }} \
+            -n maintenance-predictor
+          kubectl rollout status deployment/maintenance-predictor-canary \
+            -n maintenance-predictor --timeout=120s
+          echo "⏳ Canary deployed at 10% traffic. Monitoring for 30 minutes..."
+          sleep 1800
+
+      - name: Validate canary metrics against SLO gates
+        run: |
+          PROM="http://prometheus.acme-iot.internal/api/v1/query"
+
+          # Gate 1: canary error rate < 1% (serving/slos.yaml api_availability + canary gate in model-registry.yaml)
+          ERR_RATE=$(curl -sG "$PROM" \
+            --data-urlencode 'query=sum(rate(http_requests_total{deployment="canary",status_code=~"5.."}[30m])) / sum(rate(http_requests_total{deployment="canary"}[30m]))' \
+            | jq -r '.data.result[0].value[1] // "0"')
+          if (( $(echo "$ERR_RATE > 0.01" | bc -l) )); then
+            echo "::error::Canary error rate ${ERR_RATE} > 1% threshold. Aborting."
+            exit 1
+          fi
+
+          # Gate 2: canary p95 latency ≤ 120 ms (serving/slos.yaml alert_latency_p95)
+          P95=$(curl -sG "$PROM" \
+            --data-urlencode 'query=histogram_quantile(0.95, sum by(le)(rate(http_request_duration_seconds_bucket{deployment="canary",endpoint="/v1/predict"}[30m]))) * 1000' \
+            | jq -r '.data.result[0].value[1] // "0"')
+          if (( $(echo "$P95 > 120" | bc -l) )); then
+            echo "::error::Canary p95 latency ${P95}ms > 120ms threshold. Aborting."
+            exit 1
+          fi
+
+          echo "✅ Canary gates passed: error_rate=${ERR_RATE}, p95_ms=${P95}"
+
+      - name: Full production rollout
+        run: |
+          kubectl set image deployment/maintenance-predictor \
+            predictor=${{ needs.build-and-scan.outputs.image_tag }} \
+            -n maintenance-predictor
+          kubectl rollout status deployment/maintenance-predictor \
+            -n maintenance-predictor --timeout=300s
+
+      - name: Tag as stable (floating tag for rollback safety net)
+        run: |
+          docker pull ${{ needs.build-and-scan.outputs.image_tag }}@${{ needs.build-and-scan.outputs.image_digest }}
+          docker tag ${{ needs.build-and-scan.outputs.image_tag }} \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:stable
+          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:stable
+
+      - name: Notify success
+        run: |
+          curl -s -X POST "${{ secrets.SLACK_WEBHOOK }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"text\":\"✅ *maintenance-predictor* deployed to production: \`${{ needs.validate-model.outputs.model_version }}\`\"}"

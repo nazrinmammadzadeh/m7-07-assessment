@@ -1,0 +1,312 @@
+# monitoring/alerts.yaml
+# Prometheus alerting rules for the Predictive Maintenance Inference Service.
+#
+# Cross-reference map:
+#   Burn-rate multipliers (14.4× / 6×)  ← serving/slos.yaml burn_rate_alerts
+#   Latency threshold (120 ms)           ← serving/slos.yaml alert_latency_p95
+#   End-to-end threshold (240 s)         ← serving/slos.yaml end_to_end_alert_latency + runbooks/rollback.md
+#   X-Model-Version label                ← api/openapi.yaml components.headers.X-Model-Version
+#   Alert names AvailabilityBurnRateFast, LatencyBurnRateFast, EndToEndAlertLatencyHigh
+#                                        ← runbooks/rollback.md (trigger conditions table)
+
+groups:
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # SLO: alert_latency_p95
+  # Objective: 99.9% of 5-min windows have p95 HTTP latency ≤ 120 ms
+  # Error budget: 43.2 min / 30 days
+  # Burn-rate thresholds from serving/slos.yaml
+  # ═══════════════════════════════════════════════════════════════════════════
+  - name: slo.latency
+    rules:
+
+      - alert: LatencyBurnRateFast
+        # 1-hour window, 14.4× burn rate
+        # Fires when < 98.56% of requests in last 1h meet the 120ms budget.
+        # → ROLLBACK CANDIDATE (see runbooks/rollback.md)
+        expr: |
+          (
+            sum(rate(http_request_duration_seconds_bucket{
+              service="maintenance-predictor",
+              endpoint="/v1/predict",
+              le="0.12"
+            }[1h]))
+            /
+            sum(rate(http_request_duration_seconds_count{
+              service="maintenance-predictor",
+              endpoint="/v1/predict"
+            }[1h]))
+          ) < (1 - 14.4 * 0.001)
+        for: 2m
+        labels:
+          severity: critical
+          slo: alert_latency_p95
+          team: ml-platform
+        annotations:
+          summary: "LatencyBurnRateFast — p95 HTTP latency burning at >14.4× budget [ROLLBACK CANDIDATE]"
+          description: |
+            The p95 latency SLO (120 ms) is burning at >14.4× the allowed rate
+            over the last 1 hour. At this rate the full 30-day error budget
+            (43.2 min) will be exhausted in <2 hours.
+
+            Rollback trigger: if this alert has been firing for 5 minutes
+            and a recent deployment is active, execute runbooks/rollback.md.
+          runbook_url: "https://wiki.acme-iot.internal/runbooks/rollback"
+          dashboard_url: "https://grafana.acme-iot.internal/d/maintenance-predictor"
+
+      - alert: LatencyBurnRateSlow
+        # 6-hour window, 6× burn rate — warning only, no page
+        expr: |
+          (
+            sum(rate(http_request_duration_seconds_bucket{
+              service="maintenance-predictor",
+              endpoint="/v1/predict",
+              le="0.12"
+            }[6h]))
+            /
+            sum(rate(http_request_duration_seconds_count{
+              service="maintenance-predictor",
+              endpoint="/v1/predict"
+            }[6h]))
+          ) < (1 - 6.0 * 0.001)
+        for: 15m
+        labels:
+          severity: warning
+          slo: alert_latency_p95
+          team: ml-platform
+        annotations:
+          summary: "LatencyBurnRateSlow — elevated latency burn rate (6× over 6 h)"
+          description: |
+            p95 latency SLO burning at >6× the allowed rate over 6 hours.
+            Monitor closely. If this escalates to LatencyBurnRateFast, initiate rollback.
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # SLO: api_availability
+  # Objective: 99.9% of requests return non-5xx
+  # Error budget: 43.2 min / 30 days
+  # ═══════════════════════════════════════════════════════════════════════════
+  - name: slo.availability
+    rules:
+
+      - alert: AvailabilityBurnRateFast
+        # 1-hour window, 14.4× burn rate → error rate > 1.44%
+        # → ROLLBACK CANDIDATE (see runbooks/rollback.md)
+        expr: |
+          (
+            sum(rate(http_requests_total{
+              service="maintenance-predictor",
+              status_code=~"5.."
+            }[1h]))
+            /
+            sum(rate(http_requests_total{
+              service="maintenance-predictor"
+            }[1h]))
+          ) > (14.4 * 0.001)
+        for: 2m
+        labels:
+          severity: critical
+          slo: api_availability
+          team: ml-platform
+        annotations:
+          summary: "AvailabilityBurnRateFast — 5xx error rate >1.44% (14.4× budget) [ROLLBACK CANDIDATE]"
+          description: |
+            5xx error rate is above 1.44% over the last 1 hour (14.4× the allowed
+            budget of 0.1%). At this rate the 30-day error budget will be exhausted
+            in <2 hours.
+
+            Rollback trigger: if this alert has been firing for 5 minutes
+            and a recent deployment is active, execute runbooks/rollback.md.
+          runbook_url: "https://wiki.acme-iot.internal/runbooks/rollback"
+          dashboard_url: "https://grafana.acme-iot.internal/d/maintenance-predictor"
+
+      - alert: AvailabilityBurnRateSlow
+        # 6-hour window, 6× burn rate → error rate > 0.6%
+        expr: |
+          (
+            sum(rate(http_requests_total{
+              service="maintenance-predictor",
+              status_code=~"5.."
+            }[6h]))
+            /
+            sum(rate(http_requests_total{
+              service="maintenance-predictor"
+            }[6h]))
+          ) > (6.0 * 0.001)
+        for: 15m
+        labels:
+          severity: warning
+          slo: api_availability
+          team: ml-platform
+        annotations:
+          summary: "AvailabilityBurnRateSlow — error rate elevated (6× over 6 h)"
+          description: |
+            5xx error rate is above 0.6% over 6 hours. Monitor closely.
+            Escalate to AvailabilityBurnRateFast threshold if trend continues.
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # SLO: end_to_end_alert_latency
+  # Objective: p95 pipeline latency (MQTT → PagerDuty) ≤ 300 s
+  # Pre-trigger fires at 240 s (80% of budget) to allow intervention before SLO breach
+  # Threshold 240 s matches runbooks/rollback.md trigger table
+  # ═══════════════════════════════════════════════════════════════════════════
+  - name: slo.end_to_end
+    rules:
+
+      - alert: EndToEndAlertLatencyHigh
+        # Pre-trigger at 240 s = 80% of the 300 s SLO budget
+        # → ROLLBACK CANDIDATE (see runbooks/rollback.md)
+        # This threshold is the rollback trigger cited in runbooks/rollback.md
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le)(
+              rate(alert_pipeline_duration_seconds_bucket{
+                service="alert-dispatcher"
+              }[5m])
+            )
+          ) > 240
+        for: 5m
+        labels:
+          severity: critical
+          slo: end_to_end_alert_latency
+          team: ml-platform
+        annotations:
+          summary: "EndToEndAlertLatencyHigh — pipeline p95 >240 s (80% of 300 s SLO) [ROLLBACK CANDIDATE]"
+          description: |
+            The p95 end-to-end latency from sensor MQTT reading to PagerDuty delivery
+            has exceeded 240 seconds for 5 consecutive minutes.
+
+            This is the rollback trigger threshold defined in runbooks/rollback.md.
+            Before rolling back, check:
+            1. Flink consumer lag (Kafka consumer group: flink-stream)
+            2. Redis connectivity (/readyz endpoint)
+            3. Recent deployments in the last 2 hours
+
+            If cause is unclear and a deployment occurred within 2 h, roll back
+            using runbooks/rollback.md.
+          runbook_url: "https://wiki.acme-iot.internal/runbooks/rollback"
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Model version mismatch
+  # Detects replicas serving different model versions simultaneously.
+  # Keys on the X-Model-Version response header (api/openapi.yaml),
+  # surfaced as the 'model_version' Prometheus label on http_requests_total.
+  # ═══════════════════════════════════════════════════════════════════════════
+  - name: model.version
+    rules:
+
+      - alert: ModelVersionMismatch
+        # Count distinct values of the model_version label across all replicas.
+        # During a rolling deploy this is expected transiently; alert only if it
+        # persists beyond 5 minutes (deploy should complete in ~3 min).
+        expr: |
+          count(
+            count by (model_version)(
+              http_requests_total{
+                service="maintenance-predictor"
+              }
+            )
+          ) > 1
+        for: 5m
+        labels:
+          severity: warning
+          team: ml-platform
+        annotations:
+          summary: "ModelVersionMismatch — multiple X-Model-Version values observed for >5 min"
+          description: |
+            More than one distinct value of the X-Model-Version response header
+            (the 'model_version' metric label, defined in api/openapi.yaml) has
+            been observed across replicas for the last 5 minutes.
+
+            Expected behaviour during a rolling deploy: replicas converge to a single
+            version within ~3 minutes. If this alert fires >10 minutes after the last
+            deployment, the rolling update is stalled.
+
+            Check:
+              kubectl rollout status deployment/maintenance-predictor -n maintenance-predictor
+            If stalled, consider rolling back (runbooks/rollback.md).
+          expected_convergence_minutes: 3
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Model and data drift signals
+  # ═══════════════════════════════════════════════════════════════════════════
+  - name: model.drift
+    rules:
+
+      - alert: FeatureDriftDetected
+        # KS test p-value < 0.01 for any primary feature.
+        # Retraining trigger: matches lifecycle/lifecycle.md retraining policy.
+        expr: |
+          feature_drift_ks_pvalue{
+            service="maintenance-predictor",
+            feature=~"vibration_rms_24h|temp_mean_24h|fft_dominant_freq_hz"
+          } < 0.01
+        for: 10m
+        labels:
+          severity: warning
+          team: ml-platform
+        annotations:
+          summary: "FeatureDriftDetected — KS p-value < 0.01 on primary feature"
+          description: |
+            The Kolmogorov-Smirnov test p-value for one or more primary features
+            (vibration_rms_24h, temp_mean_24h, fft_dominant_freq_hz) has dropped
+            below 0.01, indicating the live distribution differs significantly from
+            the training baseline.
+
+            This matches the retrain trigger in lifecycle/lifecycle.md.
+            Action: notify ml-lead and queue a retrain (make retrain-emergency).
+            This does NOT require a rollback.
+
+      - alert: PredictionDistributionShift
+        expr: |
+          abs(
+            avg_over_time(failure_prob_72h{service="maintenance-predictor"}[1d])
+            -
+            avg_over_time(failure_prob_72h{service="maintenance-predictor"}[1d] offset 7d)
+          ) > 0.15
+        for: 1h
+        labels:
+          severity: warning
+          team: ml-platform
+        annotations:
+          summary: "PredictionDistributionShift — mean failure_prob_72h shifted >0.15 vs 7-day baseline"
+          description: |
+            The mean predicted failure probability today differs from the same metric
+            one week ago by more than 0.15. Could indicate a real shift in sensor
+            health, a data pipeline issue, or model drift.
+            Investigate before treating as a model quality problem.
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Infrastructure alerts
+  # ═══════════════════════════════════════════════════════════════════════════
+  - name: infra
+    rules:
+
+      - alert: BatchJobFailed
+        expr: |
+          increase(batch_job_failed_total{
+            service="maintenance-predictor-batch"
+          }[25h]) > 0
+        labels:
+          severity: critical
+          team: ml-platform
+        annotations:
+          summary: "BatchJobFailed — daily 50k-sensor inference job did not complete"
+          description: |
+            The daily batch inference job (50,000 sensors, triggered at 00:30 UTC)
+            has not completed successfully in the last 25 hours. Maintenance schedulers
+            will not have an updated failure prediction report.
+            Check Spark logs and S3 output at s3://acme-iot-data/batch-results/.
+
+      - alert: RedisFeatureStoreDown
+        expr: up{service="redis", role="feature-store"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          team: platform
+        annotations:
+          summary: "RedisFeatureStoreDown — critical inference path blocked"
+          description: |
+            The Redis feature store (ElastiCache) is unreachable.
+            The critical-path predictor /readyz will return 503; no new critical
+            sensor alerts will be generated until Redis recovers.
+            Page the platform on-call immediately.

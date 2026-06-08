@@ -1,0 +1,40 @@
+{
+  "sensors": [
+    {
+      "sensor_id": "SENS-00042",
+      "feature_vector": {
+        "vibration_rms_24h": 2.34,
+        "vibration_peak_24h": 4.12,
+        "temp_mean_24h": 67.3,
+        "temp_std_24h": 1.8,
+        "fft_dominant_freq_hz": 88.5,
+        "vibration_trend_7d": 0.12,
+        "temp_trend_7d": -0.04
+      }
+    },
+    {
+      "sensor_id": "SENS-00107",
+      "feature_vector": {
+        "vibration_rms_24h": 0.91,
+        "vibration_peak_24h": 1.45,
+        "temp_mean_24h": 62.1,
+        "temp_std_24h": 0.9,
+        "fft_dominant_freq_hz": 50.0,
+        "vibration_trend_7d": -0.02,
+        "temp_trend_7d": 0.01
+      }
+    },
+    {
+      "sensor_id": "SENS-00388",
+      "feature_vector": {
+        "vibration_rms_24h": 3.87,
+        "vibration_peak_24h": 7.21,
+        "temp_mean_24h": 79.4,
+        "temp_std_24h": 3.2,
+        "fft_dominant_freq_hz": 112.0,
+        "vibration_trend_7d": 0.41,
+        "temp_trend_7d": 0.18
+      }
+    }
+  ]
+}
